@@ -67,18 +67,16 @@ def objective(trial):
     dropout_rate = trial.suggest_float('dropout_rate', 0.1, 0.5)
     learning_rate = trial.suggest_loguniform('learning_rate', 1e-4, 1e-2)
 
-    # Filter the last 252 days for training data for this stock
-    stock_train_data = train_data[train_data['permno'] == stock_id]
-    stock_test_data = test_data[test_data['permno'] == stock_id]
+    # Prepare data with representative quarters
+    representative_quarters = quarters[:4]  # First 4 quarters as representative
+    train_data = merged_data[(merged_data['permno'] == stock_id) & (merged_data['quarter'].isin(representative_quarters))]
 
-    if len(stock_train_data) < 252:
+    if len(train_data) < 252:
         return None
 
-    # Prepare features (foreign signals) and target (same day's return)
-    X_train = torch.tensor(stock_train_data[foreign_signal_features].values, dtype=torch.float32)
-    y_train = torch.tensor(stock_train_data['same_day_return'].values, dtype=torch.float32).view(-1, 1)
-    X_test = torch.tensor(stock_test_data[foreign_signal_features].values, dtype=torch.float32).to(device)
-    y_test = torch.tensor(stock_test_data['same_day_return'].values, dtype=torch.float32).to(device)
+    # Prepare features and target
+    X_train = torch.tensor(train_data[foreign_signal_features].values, dtype=torch.float32)
+    y_train = torch.tensor(train_data['same_day_return'].values, dtype=torch.float32).view(-1, 1)
 
     # DataLoader setup
     train_dataset = TensorDataset(X_train, y_train)
@@ -108,45 +106,76 @@ def objective(trial):
             scaler.step(optimizer)
             scaler.update()
 
-    # Evaluation on test data
-    model.eval()
-    with torch.no_grad():
-        with autocast(device_type='cuda'):
-            y_pred = model(X_test).flatten()
+    # Return a dummy R^2 value for validation
+    return -1.0  # Placeholder until real validation is implemented
 
-    # Calculate performance metrics
-    r2_oo = 1 - torch.sum((y_test - y_pred) ** 2) / torch.sum((y_test - y_test.mean()) ** 2)
-    return r2_oo.item()
-
-# Main loop for training/testing across stocks and quarters
-performance_metrics = []
+# Main loop for optimization per stock
+optimized_params = {}
 quarters = merged_data['quarter'].unique()
 
 for stock_id in merged_data['permno'].unique():
-    for i in range(3, len(quarters) - 1):  # Start from the 4th quarter
-        train_quarters = quarters[i - 3:i + 1]  # Last 4 quarters (~252 trading days)
+    # Run Optuna optimization once for each stock
+    logging.info(f"Optimizing hyperparameters for stock {stock_id}...")
+    study = optuna.create_study(direction='maximize')
+    study.optimize(objective, n_trials=50)
+
+    # Save best trial parameters
+    optimized_params[stock_id] = study.best_trial.params
+    logging.info(f"Best parameters for stock {stock_id}: {study.best_trial.params}")
+
+# Main loop for training/testing using optimized hyperparameters
+performance_metrics = []
+
+for stock_id in merged_data['permno'].unique():
+    best_params = optimized_params.get(stock_id)
+    if not best_params:
+        continue
+
+    for i in range(3, len(quarters) - 1):
+        train_quarters = quarters[i - 3:i + 1]  # Last 4 quarters
         test_quarter = quarters[i + 1]  # Next quarter
 
-        # Extract training data and check its completeness
         train_data = merged_data[(merged_data['permno'] == stock_id) & (merged_data['quarter'].isin(train_quarters))]
-        if len(train_data) < 252:  # Skip if less than 252 days of training data
+        if len(train_data) < 252:
             continue
 
-        # Extract testing data
         test_data = merged_data[(merged_data['permno'] == stock_id) & (merged_data['quarter'] == test_quarter)]
 
-        # Ensure features are scaled properly
+        # Scale data
         scaler = StandardScaler()
         train_data.loc[:, foreign_signal_features] = scaler.fit_transform(train_data[foreign_signal_features])
         test_data.loc[:, foreign_signal_features] = scaler.transform(test_data[foreign_signal_features])
 
-        # Run Optuna optimization
-        study = optuna.create_study(direction='maximize')
-        study.optimize(objective, n_trials=50)
+        # Train and evaluate model with best parameters
+        model = StudyNN(len(foreign_signal_features), best_params['hidden_size1'], best_params['hidden_size2'], best_params['dropout_rate']).to(device)
+        
+        # Prepare data
+        X_train = torch.tensor(train_data[foreign_signal_features].values, dtype=torch.float32).to(device)
+        y_train = torch.tensor(train_data['same_day_return'].values, dtype=torch.float32).view(-1, 1).to(device)
+        X_test = torch.tensor(test_data[foreign_signal_features].values, dtype=torch.float32).to(device)
+        y_test = torch.tensor(test_data['same_day_return'].values, dtype=torch.float32).to(device)
 
-        # Best trial metrics
-        best_trial = study.best_trial
-        logging.info(f"Best trial for stock {stock_id} in quarter {test_quarter}: {best_trial.params}")
+        optimizer = optim.Adam(model.parameters(), lr=best_params['learning_rate'], weight_decay=1e-5)
+        criterion = nn.MSELoss()
+        model.train()
+        for epoch in range(75):
+            optimizer.zero_grad()
+            outputs = model(X_train)
+            loss = criterion(outputs, y_train)
+            loss.backward()
+            optimizer.step()
+
+        # Evaluation
+        model.eval()
+        with torch.no_grad():
+            y_pred = model(X_test).flatten()
+        r2_oo = 1 - torch.sum((y_test - y_pred) ** 2) / torch.sum((y_test - y_test.mean()) ** 2)
+        
+        performance_metrics.append({
+            'permno': stock_id,
+            'quarter': test_quarter,
+            'R2_oo': r2_oo.item()
+        })
 
 # Convert metrics to DataFrame and save
 performance_df = pd.DataFrame(performance_metrics)
